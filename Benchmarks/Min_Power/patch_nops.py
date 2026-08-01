@@ -4,135 +4,78 @@ import re
 import sys
 from pathlib import Path
 
-EXPECTED_NOPS = 1024
+START_ADDRESS = 0x01F0
+END_ADDRESS = 0x41E0
+EXPECTED_PATCHES = 1024
 
 if len(sys.argv) != 3:
-    print(
-        f"Usage: {sys.argv[0]} input.cuasm output.cuasm",
-        file=sys.stderr,
-    )
+    print(f"Usage: {sys.argv[0]} input.cuasm output.cuasm",
+          file=sys.stderr)
     sys.exit(1)
 
 input_path = Path(sys.argv[1])
 output_path = Path(sys.argv[2])
 
+section_re = re.compile(r"^\s*\.section(?:\s+|$)")
+kernel_re = re.compile(r"\.text\.nop_kernel(?:[,\s]|$)")
+address_re = re.compile(r"/\*([0-9a-fA-F]+)\*/")
+
+# Patch only the register used by the inline-assembly placeholder.
+placeholder_re = re.compile(
+    r"\bMOV\s+R8\s*,\s*R8\s*;"
+)
+
 lines = input_path.read_text().splitlines(keepends=True)
 
-section_directive = re.compile(r"^\s*\.section(?:\s+|$)")
-target_section = re.compile(r"\.text\.[^,\s]*nop_kernel[^,\s]*")
-
-# Any SASS instruction line with an address.
-instruction_line = re.compile(
-    r"/\*([0-9a-fA-F]+)\*/\s+"
-)
-
-# MOV R7, R7 ;
-self_mov = re.compile(
-    r"\bMOV\s+R([0-9]+)\s*,\s*R\1\s*;"
-)
-
 inside_kernel = False
-found_kernel = False
+patch_count = 0
+output_lines = []
 
-runs: list[list[tuple[int, int]]] = []
-current_run: list[tuple[int, int]] = []
+for line_number, line in enumerate(lines, start=1):
+    if section_re.match(line):
+        inside_kernel = bool(kernel_re.search(line))
 
-def finish_run() -> None:
-    global current_run
+    if inside_kernel:
+        address_match = address_re.search(line)
 
-    if current_run:
-        runs.append(current_run)
-        current_run = []
+        if address_match:
+            address = int(address_match.group(1), 16)
 
-for line_number, line in enumerate(lines):
-    if section_directive.match(line):
-        finish_run()
+            if START_ADDRESS <= address <= END_ADDRESS:
+                if not placeholder_re.search(line):
+                    print(
+                        f"Error: expected MOV R8, R8 at "
+                        f"address 0x{address:04x}, source line "
+                        f"{line_number}:",
+                        file=sys.stderr,
+                    )
+                    print(line.rstrip(), file=sys.stderr)
+                    print("No output written.", file=sys.stderr)
+                    sys.exit(1)
 
-        inside_kernel = bool(target_section.search(line))
+                line, replacements = placeholder_re.subn(
+                    "NOP ;",
+                    line,
+                    count=1,
+                )
+                patch_count += replacements
 
-        if inside_kernel:
-            found_kernel = True
-            print(f"Found kernel section: {line.strip()}")
+    output_lines.append(line)
 
-        continue
-
-    if not inside_kernel:
-        continue
-
-    instruction_match = instruction_line.search(line)
-
-    # Blank lines, labels and comments do not interrupt a run.
-    if not instruction_match:
-        continue
-
-    address = int(instruction_match.group(1), 16)
-
-    if self_mov.search(line):
-        current_run.append((line_number, address))
-    else:
-        # A real intervening SASS instruction ends the consecutive run.
-        finish_run()
-
-finish_run()
-
-if not found_kernel:
+if patch_count != EXPECTED_PATCHES:
     print(
-        "Error: could not find nop_kernel text section.",
+        f"Error: patched {patch_count} instructions; "
+        f"expected {EXPECTED_PATCHES}.",
         file=sys.stderr,
     )
-    sys.exit(1)
-
-runs.sort(key=len, reverse=True)
-
-print("Largest consecutive self-MOV runs:")
-
-for run in runs[:10]:
-    print(
-        f"  count={len(run):4d} "
-        f"start=0x{run[0][1]:x} "
-        f"end=0x{run[-1][1]:x}"
-    )
-
-exact_runs = [run for run in runs if len(run) == EXPECTED_NOPS]
-
-if len(exact_runs) != 1:
-    print(
-        f"Error: expected one consecutive run of exactly "
-        f"{EXPECTED_NOPS} self-MOVs, found {len(exact_runs)}.",
-        file=sys.stderr,
-    )
-
-    if runs:
-        print(
-            f"Longest run contains {len(runs[0])} instructions.",
-            file=sys.stderr,
-        )
-
     print("No output written.", file=sys.stderr)
     sys.exit(1)
 
-placeholder_run = exact_runs[0]
-lines_to_patch = {line_number for line_number, _ in placeholder_run}
-
-for line_number in lines_to_patch:
-    lines[line_number], count = self_mov.subn(
-        "NOP ;",
-        lines[line_number],
-        count=1,
-    )
-
-    if count != 1:
-        print(
-            f"Internal error patching line {line_number + 1}.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-output_path.write_text("".join(lines))
+output_path.write_text("".join(output_lines))
 
 print(
-    f"Patched {len(lines_to_patch)} consecutive self-MOVs "
-    f"from 0x{placeholder_run[0][1]:x} "
-    f"through 0x{placeholder_run[-1][1]:x}."
+    f"Patched exactly {patch_count} MOV R8, R8 instructions "
+    f"from 0x{START_ADDRESS:04x} through "
+    f"0x{END_ADDRESS:04x}."
 )
 print(f"Wrote {output_path}")
